@@ -284,8 +284,9 @@ func main() {
 	}
 	defer c.Close()
 
-	log.Println("连接成功！发送新游戏请求...")
+	log.Println("连接成功！")
 	if *Reset { // 如果需要每次运行开启新的一局
+		log.Println("发送新游戏请求...")
 		c.WriteMessage(websocket.TextMessage, []byte(`{"type":"new_game","data":{}}`))
 	}
 
@@ -293,7 +294,9 @@ func main() {
 
 	go func() {
 		defer close(done)
+		var Score int
 		for {
+
 			_, message, err := c.ReadMessage()
 			if err != nil {
 				log.Println("读取消息失败:", err)
@@ -305,47 +308,65 @@ func main() {
 				continue
 			}
 
-			if serverMsg.Type == "game_state" {
-				var gameState GameStateData
-				if err := json.Unmarshal(serverMsg.Data, &gameState); err != nil {
-					continue
-				}
+			var gameState GameStateData
+			if err := json.Unmarshal(serverMsg.Data, &gameState); err != nil {
+				log.Println("解析游戏状态失败:", err)
+				continue
+			}
 
+			if gameState.GameOver || gameState.Message == "Game is already finished" || serverMsg.Type == "error" {
+				log.Println("游戏结束!", "最终得分:", Score)
+				c.WriteMessage(websocket.TextMessage, []byte(`{"type":"new_game","data":{}}`))
+				log.Println("重置新对局")
+				interrupt <- os.Interrupt
+				return
+			}
+
+			if serverMsg.Type == "game_state" {
+				Score = gameState.Score
 				fmt.Printf("\n--- 收到新状态 | 分数: %d ---\n", gameState.Score)
 				gameState.Board.printBoard()
 				fmt.Printf("游戏状态: %v\n", gameState.GameOver)
-				if gameState.GameOver {
-					log.Println("游戏结束!", "最终得分:", gameState.Score)
-					interrupt <- os.Interrupt
-					return
-				}
 
+				var moveJSON []byte
 				startTime := time.Now()
-				log.Println("AI 正在并行计算最佳移动...")
 
-				bestDir := FindBestMove(gameState.Board, *depth)
+				if gameState.Score < 20 {
+					//20分以内随机移动
+					log.Println("AI 决策: 随机移动")
+					bestDir := possibleMoves[rand.Intn(len(possibleMoves))]
+					moveJSON, err = moveToJson(bestDir)
+					if err != nil {
+						log.Println("创建移动指令失败:", err)
+						continue
+					}
+				} else {
+					log.Println("AI 正在并行计算最佳移动...")
+					bestDir := FindBestMove(gameState.Board, *depth)
+					if bestDir == -1 {
+						log.Println("AI 未能找到有效移动，随机选择一个。")
+						bestDir = possibleMoves[rand.Intn(len(possibleMoves))]
+					}
 
+					log.Printf("AI 决策: %s", directionToString[bestDir])
+
+					moveJSON, err = moveToJson(bestDir)
+					if err != nil {
+						log.Println("创建移动指令失败:", err)
+					}
+				}
 				duration := time.Since(startTime)
 				log.Printf("计算耗时: %s", duration)
-
-				if bestDir == -1 {
-					log.Println("AI 未能找到有效移动，随机选择一个。")
-					bestDir = possibleMoves[rand.Intn(len(possibleMoves))]
-				}
-
-				log.Printf("AI 决策: %s", directionToString[bestDir])
-
-				moveJSON, _ := moveToJson(bestDir)
-
 				// 保证最小的移动间隔，避免被服务器限流
 				if duration < 100*time.Millisecond {
+					log.Printf("等待 %s 以满足服务器要求", 100*time.Millisecond-duration)
 					time.Sleep(100*time.Millisecond - duration)
 				}
-
+				log.Printf("发送移动指令: %s", string(moveJSON))
 				err = c.WriteMessage(websocket.TextMessage, moveJSON)
 				if err != nil {
 					log.Println("发送移动指令失败:", err)
-					return
+					continue
 				}
 			}
 		}
