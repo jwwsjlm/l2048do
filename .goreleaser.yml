@@ -17,7 +17,7 @@ builds:
     # 使用 ldflags 可以在编译时注入版本号等信息
     # 这样你可以在代码里通过 `main.version` `main.commit` 来获取它们
     ldflags:
-      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
+      - -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
 
     # 平台和架构配置，等同于您旧的 matrix
     goos:

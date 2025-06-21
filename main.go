@@ -19,6 +19,7 @@ import (
 	_ "go.uber.org/automaxprocs" // 自动设置 GOMAXPROCS
 )
 
+var version = "1.0.0" // 版本号
 type ServerMessage struct {
 	Type string
 	Data json.RawMessage
@@ -253,7 +254,7 @@ func main() {
 	depth := flag.Int("depth", 4, "AI 决策深度，推荐4-6。默认为4")
 	Reset := flag.Bool("reset", false, "是否每次运行开启新的一局")
 	flag.Parse()
-
+	fmt.Printf("2048 死算 版本: %s\n", version)
 	httpRequestText, err := os.ReadFile(*url)
 	if err != nil {
 		log.Fatal("读取文件失败:", err)
