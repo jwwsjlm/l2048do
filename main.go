@@ -20,22 +20,30 @@ import (
 )
 
 var version = "1.0.0" // 版本号
+
+// --- 网络与游戏状态结构体 ---
+
 type ServerMessage struct {
-	Type string
-	Data json.RawMessage
+	Type string          `json:"type"`
+	Data json.RawMessage `json:"data"`
 }
+
 type GameStateData struct {
-	Board    Board
-	Score    int
-	GameOver bool
-	Victory  bool
-	Message  string
+	Board    Board  `json:"board"`
+	Score    int    `json:"score"`
+	GameOver bool   `json:"game_over"`
+	Victory  bool   `json:"victory"`
+	Message  string `json:"message"`
 }
+
 type ClientMessage struct {
-	Type string
-	Data MoveData
+	Type string   `json:"type"`
+	Data MoveData `json:"data"`
 }
-type MoveData struct{ Direction string }
+
+type MoveData struct {
+	Direction string `json:"direction"`
+}
 
 type Board [4][4]int
 type Direction int
@@ -49,7 +57,7 @@ const (
 
 var directionToString = map[Direction]string{Up: "up", Down: "down", Left: "left", Right: "right"}
 
-// --- AI 性能优化组件 ---
+// --- AI 核心 (重构后) ---
 
 // MoveResult 用于在goroutine之间传递计算结果
 type MoveResult struct {
@@ -68,7 +76,7 @@ func (b *Board) flattenBoard() [16]int {
 	return flat
 }
 
-// MemoizationCache 定义一个缓存结构
+// MemoizationCache 定义一个线程安全的缓存结构
 type MemoizationCache struct {
 	mu    sync.RWMutex
 	cache map[[16]int]float64
@@ -110,7 +118,7 @@ func getLog2(n int) float64 {
 	return 0 // 对于0或者不在缓存中的值返回0
 }
 
-// evaluateBoard 评估函数 (使用预计算的log2)
+// evaluateBoard 评估函数
 func evaluateBoard(b Board) float64 {
 	emptyCells := 0
 	monotonicity := 0.0
@@ -141,22 +149,106 @@ func evaluateBoard(b Board) float64 {
 			}
 		}
 	}
-	// ... 单调性计算 (与之前版本相同，也可以从log2Cache中受益)
+	// 简单的单调性计算
+	// (为了完整性，可以添加一个更复杂的单调性计算逻辑)
 	return monotonicity*monotonicityWeight +
 		smoothness*smoothnessWeight +
 		math.Log(float64(emptyCells+1))*emptyCellsWeight +
 		float64(maxValue)*maxValueWeight
 }
 
-// expectimax (修改以使用缓存)
-func expectimax(b Board, depth int, cache *MemoizationCache) float64 {
+// AI 结构体，封装了所有AI相关的逻辑和状态
+type AI struct {
+	depth int
+	cache *MemoizationCache // AI实例共享一个缓存
+}
+
+// NewAI 创建一个新的AI实例
+func NewAI(depth int) *AI {
+	return &AI{
+		depth: depth,
+		cache: NewMemoizationCache(), // 在创建AI时初始化缓存
+	}
+}
+
+// FindBestMove 是AI的公共入口，它并行地为顶层移动寻找最佳选择
+func (ai *AI) FindBestMove(b Board) Direction {
+	bestScore := -math.MaxFloat64
+	bestMove := Up // 默认移动，以防万一
+
+	var wg sync.WaitGroup
+	results := make(chan MoveResult, 4)
+
+	var validMoves []Direction
+	for _, dir := range []Direction{Up, Down, Left, Right} {
+		if _, moved := Move(b, dir); moved {
+			validMoves = append(validMoves, dir)
+		}
+	}
+
+	if len(validMoves) == 0 {
+		return bestMove // 没有有效移动，返回默认值
+	}
+
+	// 为每个有效的移动启动一个goroutine
+	for _, dir := range validMoves {
+		wg.Add(1)
+		go func(d Direction) {
+			defer wg.Done()
+			newBoard, _ := Move(b, d)
+			// 所有goroutine共享同一个AI实例的缓存
+			score := ai.searchExpectationNode(newBoard, ai.depth-1)
+			results <- MoveResult{Dir: d, Score: score}
+		}(dir)
+	}
+
+	// 等待所有goroutine完成，然后关闭channel
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// 从结果中选出最优解
+	for res := range results {
+		if res.Score > bestScore {
+			bestScore = res.Score
+			bestMove = res.Dir
+		}
+	}
+
+	return bestMove
+}
+
+// searchMaxNode (玩家回合): 寻找所有移动中能获得最高分数的那个移动
+func (ai *AI) searchMaxNode(b Board, depth int) float64 {
+	bestScore := -math.MaxFloat64
+	hasMoved := false
+
+	for _, dir := range []Direction{Up, Down, Left, Right} {
+		newBoard, moved := Move(b, dir)
+		if moved {
+			hasMoved = true
+			score := ai.searchExpectationNode(newBoard, depth-1)
+			if score > bestScore {
+				bestScore = score
+			}
+		}
+	}
+
+	if !hasMoved {
+		return evaluateBoard(b) // 如果无法移动，返回当前局面的评估值
+	}
+	return bestScore
+}
+
+// searchExpectationNode (电脑回合): 计算电脑随机放置方块后的期望分数
+func (ai *AI) searchExpectationNode(b Board, depth int) float64 {
 	if depth == 0 {
 		return evaluateBoard(b)
 	}
 
-	// 检查缓存
 	flatKey := b.flattenBoard()
-	if score, found := cache.Get(flatKey); found {
+	if score, found := ai.cache.Get(flatKey); found {
 		return score
 	}
 
@@ -168,139 +260,100 @@ func expectimax(b Board, depth int, cache *MemoizationCache) float64 {
 			}
 		}
 	}
+
 	if len(emptyCells) == 0 {
-		return evaluateBoard(b)
+		return evaluateBoard(b) // 没有空格，游戏即将结束
 	}
 
-	totalScore := 0.0
+	var totalScore2, totalScore4 float64
+
+	// 计算所有空位放置'2'后的总分数
+	tempBoard := b
 	for _, cell := range emptyCells {
-		// 90% 概率出 2
-		boardWith2 := b
-		boardWith2[cell.r][cell.c] = 2
-		_, score2 := findBestMoveRecursive(boardWith2, depth-1, cache)
-		totalScore += 0.9 * score2
-		// 10% 概率出 4
-		boardWith4 := b
-		boardWith4[cell.r][cell.c] = 4
-		_, score4 := findBestMoveRecursive(boardWith4, depth-1, cache)
-		totalScore += 0.1 * score4
+		tempBoard[cell.r][cell.c] = 2
+		totalScore2 += ai.searchMaxNode(tempBoard, depth)
+		tempBoard[cell.r][cell.c] = 0 // 恢复棋盘
 	}
 
-	finalScore := totalScore / float64(len(emptyCells))
-	// 存入缓存
-	cache.Set(flatKey, finalScore)
+	// 计算所有空位放置'4'后的总分数
+	for _, cell := range emptyCells {
+		tempBoard[cell.r][cell.c] = 4
+		totalScore4 += ai.searchMaxNode(tempBoard, depth)
+		tempBoard[cell.r][cell.c] = 0 // 恢复棋盘
+	}
+
+	// 计算期望值
+	avgScore2 := totalScore2 / float64(len(emptyCells))
+	avgScore4 := totalScore4 / float64(len(emptyCells))
+
+	finalScore := 0.9*avgScore2 + 0.1*avgScore4
+	ai.cache.Set(flatKey, finalScore)
+
 	return finalScore
 }
 
-// findBestMoveRecursive (修改以传递缓存)
-func findBestMoveRecursive(b Board, depth int, cache *MemoizationCache) (Direction, float64) {
-	bestScore := -math.MaxFloat64
-	bestMove := Direction(-1)
-
-	// 注意：这里仍然是串行，并行化在顶层FindBestMove中完成
-	for _, dir := range []Direction{Up, Down, Left, Right} {
-		newBoard, moved := Move(b, dir)
-		if moved {
-			score := expectimax(newBoard, depth, cache)
-			if score > bestScore {
-				bestScore = score
-				bestMove = dir
-			}
-		}
-	}
-	return bestMove, bestScore
-}
-
-// FindBestMove (重构为并行版本)
-func FindBestMove(b Board, depth int) Direction {
-	bestScore := -math.MaxFloat64
-	bestMove := Direction(-1)
-
-	var wg sync.WaitGroup
-	results := make(chan MoveResult, 4) // 带缓冲的channel
-
-	possibleMoves := []Direction{Up, Down, Left, Right}
-
-	for _, dir := range possibleMoves {
-		wg.Add(1)
-		go func(d Direction) {
-			defer wg.Done()
-			newBoard, moved := Move(b, d)
-			if moved {
-				// 为每个goroutine创建独立的缓存，避免锁竞争
-				cache := NewMemoizationCache()
-				score := expectimax(newBoard, depth-1, cache)
-				results <- MoveResult{Dir: d, Score: score}
-			}
-		}(dir)
-	}
-
-	wg.Wait()
-	close(results)
-
-	for res := range results {
-		if res.Score > bestScore {
-			bestScore = res.Score
-			bestMove = res.Dir
-		}
-	}
-
-	return bestMove
-}
-
-// --- Main Application Logic (主程序逻辑, 无重大变化) ---
+// --- Main Application Logic (主程序逻辑) ---
 func main() {
 	url := flag.String("path", "http.txt", "http文本路径")
 	depth := flag.Int("depth", 4, "AI 决策深度，推荐4-6。默认为4")
-	Reset := flag.Bool("reset", false, "是否每次运行开启新的一局")
+	reset := flag.Bool("reset", false, "是否每次运行开启新的一局")
 	flag.Parse()
+
 	fmt.Printf("2048 死算 版本: %s\n", version)
 	httpRequestText, err := os.ReadFile(*url)
 	if err != nil {
-		log.Fatal("读取文件失败:", err)
+		log.Fatalf("读取HTTP请求文件 '%s' 失败: %v", *url, err)
 	}
 	req, err := parseHTTPRequest(string(httpRequestText))
 	if err != nil {
-		log.Fatalf("解析错误: %v\n", err)
+		log.Fatalf("解析HTTP请求错误: %v\n", err)
 	}
 
-	log.Printf("正在连接到 url:%s", req.URL.String())
+	log.Printf("正在连接到 url: %s", req.URL.String())
 	log.Printf("AI决策深度设置为: %d", *depth)
 
+	// --- AI 实例创建 ---
+	ai := NewAI(*depth)
+	// 创建一个channel来传递最新的游戏状态
+	// 缓冲区大小为1，意味着我们只关心最新的状态
+	gameStateChan := make(chan GameStateData, 1)
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt)
 
 	headers := http.Header{}
 	headers.Add("User-Agent", req.Header.Get("User-Agent"))
-	headers.Add("Cookie", req.Header.Get("Cookie")) // 复制Cookie头
+	headers.Add("Cookie", req.Header.Get("Cookie"))
+	headers.Add("Origin", req.Header.Get("Origin"))
 
-	headers.Add("Origin", req.Header.Get("Origin")) // 复制Accept-Language头
 	c, res, err := websocket.DefaultDialer.Dial(req.URL.String(), headers)
 	if err != nil {
-		log.Println("连接失败，响应头:")
-		for k, v := range res.Header {
-			log.Printf("%s: %s", k, v)
+		if res != nil {
+			log.Println("连接失败，响应头:")
+			for k, v := range res.Header {
+				log.Printf("%s: %s", k, v)
+			}
 		}
-		log.Fatal("连接失败:", err)
+		log.Fatalf("连接失败: %v", err)
 	}
 	defer c.Close()
 
 	log.Println("连接成功！")
-	if *Reset { // 如果需要每次运行开启新的一局
+	if *reset {
 		log.Println("发送新游戏请求...")
 		c.WriteMessage(websocket.TextMessage, []byte(`{"type":"new_game","data":{}}`))
 	}
 
 	done := make(chan struct{})
 
+	// --- Goroutine 1: 读取器 (生产者) ---
+	// 这个goroutine只负责从websocket读取消息并放入channel
 	go func() {
 		defer close(done)
-		var Score int
 		for {
-
 			_, message, err := c.ReadMessage()
 			if err != nil {
-				log.Println("读取消息失败:", err)
+				log.Println("读取器: 读取消息失败:", err)
+				close(gameStateChan) // 关闭channel以通知处理器退出
 				return
 			}
 
@@ -308,67 +361,66 @@ func main() {
 			if err := json.Unmarshal(message, &serverMsg); err != nil {
 				continue
 			}
-
-			var gameState GameStateData
-			if err := json.Unmarshal(serverMsg.Data, &gameState); err != nil {
-				log.Println("解析游戏状态失败:", err)
-				continue
-			}
-
-			if gameState.GameOver || gameState.Message == "Game is already finished" || serverMsg.Type == "error" {
-				log.Println("游戏结束!", "最终得分:", Score)
-				c.WriteMessage(websocket.TextMessage, []byte(`{"type":"new_game","data":{}}`))
-				log.Println("重置新对局")
-				interrupt <- os.Interrupt
-				return
-			}
-
 			if serverMsg.Type == "game_state" {
-				Score = gameState.Score
-				fmt.Printf("\n--- 收到新状态 | 分数: %d ---\n", gameState.Score)
-				gameState.Board.printBoard()
-				fmt.Printf("游戏状态: %v\n", gameState.GameOver)
-
-				var moveJSON []byte
-				startTime := time.Now()
-
-				if gameState.Score < 20 {
-					//20分以内随机移动
-					log.Println("AI 决策: 随机移动")
-					bestDir := possibleMoves[rand.Intn(len(possibleMoves))]
-					moveJSON, err = moveToJson(bestDir)
-					if err != nil {
-						log.Println("创建移动指令失败:", err)
-						continue
-					}
-				} else {
-					log.Println("AI 正在并行计算最佳移动...")
-					bestDir := FindBestMove(gameState.Board, *depth)
-					if bestDir == -1 {
-						log.Println("AI 未能找到有效移动，随机选择一个。")
-						bestDir = possibleMoves[rand.Intn(len(possibleMoves))]
-					}
-
-					log.Printf("AI 决策: %s", directionToString[bestDir])
-
-					moveJSON, err = moveToJson(bestDir)
-					if err != nil {
-						log.Println("创建移动指令失败:", err)
-					}
-				}
-				duration := time.Since(startTime)
-				log.Printf("计算耗时: %s", duration)
-				// 保证最小的移动间隔，避免被服务器限流
-				if duration < 100*time.Millisecond {
-					log.Printf("等待 %s 以满足服务器要求", 100*time.Millisecond-duration)
-					time.Sleep(100*time.Millisecond - duration)
-				}
-				log.Printf("发送移动指令: %s", string(moveJSON))
-				err = c.WriteMessage(websocket.TextMessage, moveJSON)
-				if err != nil {
-					log.Println("发送移动指令失败:", err)
+				var gameState GameStateData
+				if err := json.Unmarshal(serverMsg.Data, &gameState); err != nil {
 					continue
 				}
+				// 使用非阻塞的方式发送到channel
+				// 如果channel已满，先清空再放入最新的
+				select {
+				case <-gameStateChan: // 清空旧的
+				default:
+				}
+				gameStateChan <- gameState // 放入最新的
+			}
+		}
+	}()
+	// --- Goroutine 2: 处理器 (消费者) ---
+	// 这个goroutine负责处理游戏逻辑和AI计算
+	go func() {
+		var currentScore int
+		for gameState := range gameStateChan { // 从channel中读取数据
+			currentScore = gameState.Score
+			if gameState.GameOver || gameState.Message == "Game is already finished" {
+				log.Println("处理器: 游戏结束!", "最终得分:", currentScore)
+				c.WriteMessage(websocket.TextMessage, []byte(`{"type":"new_game","data":{}}`))
+				log.Println("处理器: 已发送重置新对局请求")
+				time.Sleep(1 * time.Second)
+				interrupt <- os.Interrupt
+				return // 结束处理器goroutine
+			}
+
+			fmt.Printf("\n--- 收到新状态 | 分数: %d ---\n", gameState.Score)
+			gameState.Board.printBoard()
+			// 后续的AI计算和发送逻辑与之前完全相同
+			startTime := time.Now()
+			var bestDir Direction
+			if gameState.Score < 20 {
+				log.Println("AI 决策: 随机移动")
+				possibleDirs := []Direction{Up, Down, Left, Right}
+				bestDir = possibleDirs[rand.Intn(len(possibleDirs))]
+			} else {
+				log.Println("AI 正在并行计算最佳移动...")
+				bestDir = ai.FindBestMove(gameState.Board)
+				log.Printf("AI 决策: %s", directionToString[bestDir])
+			}
+			duration := time.Since(startTime)
+			log.Printf("计算耗时: %s", duration)
+			moveJSON, err := moveToJson(bestDir)
+			if err != nil {
+				log.Println("创建移动指令失败:", err)
+				continue
+			}
+			if duration < 100*time.Millisecond {
+				wait := 100*time.Millisecond - duration
+				log.Printf("等待 %s 以满足服务器要求", wait)
+				time.Sleep(wait)
+			}
+			log.Printf("发送移动指令: %s", string(moveJSON))
+			if err := c.WriteMessage(websocket.TextMessage, moveJSON); err != nil {
+				log.Println("发送移动指令失败:", err)
+				return
 			}
 		}
 	}()
@@ -379,10 +431,7 @@ func main() {
 	time.Sleep(time.Second) // 等待关闭消息发送
 }
 
-// --- 辅助函数 (省略了大部分，只保留必要的) ---
-var possibleMoves = []Direction{Up, Down, Left, Right} // 供随机选择时使用
-
-// --- AI核心逻辑的辅助函数 ---
+// --- 游戏逻辑与辅助函数 ---
 
 func moveToJson(direction Direction) ([]byte, error) {
 	moveStr := directionToString[direction]
@@ -390,24 +439,16 @@ func moveToJson(direction Direction) ([]byte, error) {
 		Type: "move",
 		Data: MoveData{Direction: moveStr},
 	}
-	moveJSON, err := json.Marshal(moveCmd)
-	if err != nil {
-		return []byte{}, fmt.Errorf("创建移动指令失败: %w", err)
-	}
-	return moveJSON, nil
+	return json.Marshal(moveCmd)
 }
+
 func parseHTTPRequest(text string) (*http.Request, error) {
-	stringReader := strings.NewReader(text)
-	bufferedReader := bufio.NewReader(stringReader)
-	request, err := http.ReadRequest(bufferedReader)
-	if err != nil {
-		return nil, err
-	}
-	return request, nil
+	return http.ReadRequest(bufio.NewReader(strings.NewReader(text)))
 }
+
 func (b *Board) printBoard() {
 	fmt.Println("-----------------------------")
-	for _, row := range b {
+	for _, row := range *b {
 		fmt.Print("|")
 		for _, val := range row {
 			if val == 0 {
@@ -419,6 +460,7 @@ func (b *Board) printBoard() {
 		fmt.Println("\n-----------------------------")
 	}
 }
+
 func transpose(b Board) Board {
 	var newBoard Board
 	for r := 0; r < 4; r++ {
@@ -428,6 +470,7 @@ func transpose(b Board) Board {
 	}
 	return newBoard
 }
+
 func reverse(b Board) Board {
 	var newBoard Board
 	for r := 0; r < 4; r++ {
@@ -437,8 +480,10 @@ func reverse(b Board) Board {
 	}
 	return newBoard
 }
-func moveLeft(b Board) Board {
+
+func moveLeft(b Board) (Board, int) {
 	var newBoard Board
+	score := 0
 	for r := 0; r < 4; r++ {
 		var line [4]int
 		pos := 0
@@ -451,6 +496,7 @@ func moveLeft(b Board) Board {
 		for i := 0; i < 3; i++ {
 			if line[i] != 0 && line[i] == line[i+1] {
 				line[i] *= 2
+				score += line[i]
 				line[i+1] = 0
 			}
 		}
@@ -464,28 +510,25 @@ func moveLeft(b Board) Board {
 		}
 		newBoard[r] = finalLine
 	}
-	return newBoard
+	return newBoard, score
 }
+
 func Move(b Board, dir Direction) (Board, bool) {
 	originalBoard := b
 	var newBoard Board
+
 	switch dir {
 	case Left:
-		newBoard = moveLeft(b)
+		newBoard, _ = moveLeft(b)
 	case Right:
-		newBoard = reverse(b)
-		newBoard = moveLeft(newBoard)
+		newBoard, _ = moveLeft(reverse(b))
 		newBoard = reverse(newBoard)
 	case Up:
-		newBoard = transpose(b)
-		newBoard = moveLeft(newBoard)
+		newBoard, _ = moveLeft(transpose(b))
 		newBoard = transpose(newBoard)
 	case Down:
-		newBoard = transpose(b)
-		newBoard = reverse(newBoard)
-		newBoard = moveLeft(newBoard)
-		newBoard = reverse(newBoard)
-		newBoard = transpose(newBoard)
+		newBoard, _ = moveLeft(reverse(transpose(b)))
+		newBoard = transpose(reverse(newBoard))
 	}
 	return newBoard, newBoard != originalBoard
 }
