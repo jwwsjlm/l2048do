@@ -42,7 +42,6 @@ archives:
     # 将这些额外的文件也包含到压缩包中
     files:
       - README.md
-      - LICENSE
 
 # 生成校验和文件 (例如: checksums.txt)，这是一个最佳实践
 checksum:
