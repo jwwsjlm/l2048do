@@ -270,18 +270,16 @@ func main() {
 	signal.Notify(interrupt, os.Interrupt)
 
 	headers := http.Header{}
-	headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
-	// 从解析的请求中复制所有必要的头信息
-	for key, values := range req.Header {
-		if key == "Cookie" || key == "Origin" { // 举例：复制关键Header
-			for _, value := range values {
-				headers.Add(key, value)
-			}
-		}
-	}
+	headers.Add("User-Agent", req.Header.Get("User-Agent"))
+	headers.Add("Cookie", req.Header.Get("Cookie")) // 复制Cookie头
 
-	c, _, err := websocket.DefaultDialer.Dial(req.URL.String(), headers)
+	headers.Add("Origin", req.Header.Get("Origin")) // 复制Accept-Language头
+	c, res, err := websocket.DefaultDialer.Dial(req.URL.String(), headers)
 	if err != nil {
+		log.Println("连接失败，响应头:")
+		for k, v := range res.Header {
+			log.Printf("%s: %s", k, v)
+		}
 		log.Fatal("连接失败:", err)
 	}
 	defer c.Close()
@@ -315,7 +313,7 @@ func main() {
 
 				fmt.Printf("\n--- 收到新状态 | 分数: %d ---\n", gameState.Score)
 				gameState.Board.printBoard()
-
+				fmt.Printf("游戏状态: %v\n", gameState.GameOver)
 				if gameState.GameOver {
 					log.Println("游戏结束!", "最终得分:", gameState.Score)
 					interrupt <- os.Interrupt
