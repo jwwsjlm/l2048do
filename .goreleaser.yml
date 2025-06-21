@@ -1,0 +1,62 @@
+# .goreleaser.yml - GoReleaser 配置文件
+
+# 从您的旧配置中获取项目名
+project_name: 2048-ai-solver
+
+# 在构建前运行的钩子，例如 `go mod tidy` 确保依赖是干净的
+before:
+  hooks:
+    - go mod tidy
+    - go generate ./...
+
+# 构建配置。这里定义了所有交叉编译的目标
+builds:
+  - # 定义一个构建目标
+    # 从您的旧配置中获取 main.go 的路径
+    main: .
+    # 使用 ldflags 可以在编译时注入版本号等信息
+    # 这样你可以在代码里通过 `main.version` `main.commit` 来获取它们
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
+
+    # 平台和架构配置，等同于您旧的 matrix
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+    # 排除不支持的平台组合，等同于您旧的 exclude
+    ignore:
+      - goos: windows
+        goarch: arm64
+
+# 打包配置。这里定义了如何创建 .zip 和 .tar.gz 文件
+archives:
+  - # 定义打包规则
+    # 格式化压缩包的名称，等同于您旧的 asset_name
+    # 例如：2048-ai-solver-v1.0.1-linux-amd64.tar.gz
+    name_template: "{{ .ProjectName }}-{{ .Tag }}-{{ .Os }}-{{ .Arch }}"
+    # 将这些额外的文件也包含到压缩包中
+    files:
+      - README.md
+      - LICENSE
+
+# 生成校验和文件 (例如: checksums.txt)，这是一个最佳实践
+checksum:
+  name_template: 'checksums.txt'
+
+# 自动生成快照（用于测试）和发布日志
+snapshot:
+  name_template: "{{ incpatch .Version }}-next"
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - 'Merge pull request'
+

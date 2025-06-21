@@ -251,11 +251,9 @@ func FindBestMove(b Board, depth int) Direction {
 func main() {
 	url := flag.String("path", "http.txt", "http文本路径")
 	depth := flag.Int("depth", 4, "AI 决策深度，推荐4-6。默认为4")
+	Reset := flag.Bool("reset", false, "是否每次运行开启新的一局")
 	flag.Parse()
 
-	// ... (省略)
-
-	// 这里假设您已经成功解析了 httpRequestText 并得到了 req
 	httpRequestText, err := os.ReadFile(*url)
 	if err != nil {
 		log.Fatal("读取文件失败:", err)
@@ -289,7 +287,10 @@ func main() {
 	defer c.Close()
 
 	log.Println("连接成功！发送新游戏请求...")
-	c.WriteMessage(websocket.TextMessage, []byte(`{"type":"new_game","data":{}}`))
+	if *Reset { // 如果需要每次运行开启新的一局
+		c.WriteMessage(websocket.TextMessage, []byte(`{"type":"new_game","data":{}}`))
+	}
+
 	done := make(chan struct{})
 
 	go func() {
