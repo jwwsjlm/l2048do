@@ -1,0 +1,15 @@
+GET wss://2048.linux.do/ws?token=****************** HTTP/1.1
+Host: 2048.linux.do
+Connection: Upgrade
+Pragma: no-cache
+Cache-Control: no-cache
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36
+Upgrade: websocket
+Origin: https://2048.linux.do
+Sec-WebSocket-Version: 13
+Accept-Encoding: gzip, deflate, br, zstd
+Accept-Language: zh-CN,zh;q=0.9,en;q=0.8
+Cookie: __stripe_mid=***********; auth_token=**************************; cf_clearance=****************
+Sec-WebSocket-Key: 3LWnYo+r0/s8Z56h/Lu4hw==
+Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits
+
