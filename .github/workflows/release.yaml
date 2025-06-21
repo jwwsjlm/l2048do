@@ -1,0 +1,70 @@
+# 工作流名称
+name: Build and Release
+
+on:
+  release:
+    types: [created] # 当在 GitHub 上创建新的 Release 时触发
+
+# 使用 env 来设置全局变量，方便统一管理
+env:
+  # 你可以修改为你的项目名，这将用作二进制文件和压缩包的名称
+  PROJECT_NAME: 2048-ai-solver 
+  # 指定 Go 版本
+  GO_VERSION: '^1.24.4'
+  # main.go 文件所在的目录路径
+  GO_PROJECT_PATH: '.' # 如果你的 main.go 在根目录，就用 '.'；如果在 'cmd/app/'，就用 './cmd/app'
+
+jobs:
+  build-and-release:
+    name: Build on ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, windows, darwin]
+        goarch: [amd64, arm64]
+        exclude:
+          # Go 官方对 windows/arm64 的支持尚不完善，通常我们排除它
+          - goos: windows
+            goarch: arm64
+    
+    steps:
+      # 步骤1: 检出代码
+      # 使用 actions/checkout 来获取你的仓库代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 步骤2: 设置 Go 环境
+      # 使用 actions/setup-go 来初始化 Go 环境，并开启依赖缓存
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # 开启缓存，可以显著提升后续构建速度
+          cache: true 
+
+      # 步骤3: 编译并上传到 Release
+      # 使用 wangyoucao577/go-release-action 来完成编译、打包和上传
+      # 这个 Action 会自动处理 .exe 后缀和创建 .tar.gz/.zip 压缩包
+      - name: Build and upload release assets
+        uses: wangyoucao577/go-release-action@v1.5
+        with:
+          # 优化点1: 使用 GitHub 自动提供的 GITHUB_TOKEN，更安全标准
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          
+          # 优化点2: 从 env 上下文读取配置，更清晰
+          project_path: ${{ env.GO_PROJECT_PATH }}
+          binary_name: ${{ env.PROJECT_NAME }}
+          
+          # 使用构建矩阵中的变量来指定目标平台和架构
+          goos: ${{ matrix.goos }}
+          goarch: ${{ matrix.goarch }}
+
+          # 优化点3: 移除 goversion，因为 setup-go 已经统一管理了Go版本
+          # goversion: "..." # 已移除
+
+          # 定义最终生成的压缩包名称，格式更友好
+          # 例如: 2048-ai-solver-v1.0.1-linux-amd64
+          asset_name: ${{ env.PROJECT_NAME }}-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}
+
+          # 优化点4: 将额外的文件打包到压缩包中，对用户更友好
+          extra_files: README.md LICENSE
