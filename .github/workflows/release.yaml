@@ -9,6 +9,8 @@ jobs:
   # 整个发布流程只需要一个 Job
   goreleaser:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 授予发布权限
     steps:
       # 步骤1: 检出代码
       - name: Checkout repository
