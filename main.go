@@ -422,70 +422,82 @@ func (ai *AI) searchExpectationNode(b Board, depth int) float64 {
 	return finalScore
 }
 
-// --- Main Application Logic (主程序逻辑) ---
-func main() {
-	url := flag.String("path", "http.txt", "http文本路径")
-	depth := flag.Int("depth", 4, "AI 决策深度，推荐4-6。默认为4")
-	reset := flag.Bool("reset", false, "是否每次运行开启新的一局")
-	flag.Parse()
+type sessionEvent struct {
+	reconnect bool
+	err       error
+}
 
-	fmt.Printf("2048 死算 版本: %s\n", version)
-	httpRequestText, err := os.ReadFile(*url)
-	if err != nil {
-		log.Fatalf("读取HTTP请求文件 '%s' 失败: %v", *url, err)
-	}
-	req, err := parseHTTPRequest(string(httpRequestText))
-	if err != nil {
-		log.Fatalf("解析HTTP请求错误: %v\n", err)
-	}
-
-	log.Printf("正在连接到 url: %s", req.URL.String())
-	log.Printf("AI决策深度设置为: %d", *depth)
-
-	// --- AI 实例创建 ---
-	ai := NewAI(*depth)
-	// 创建一个channel来传递最新的游戏状态
-	// 缓冲区大小为1，意味着我们只关心最新的状态
-	gameStateChan := make(chan GameStateData, 1)
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt)
-
+func buildWebSocketHeaders(req *http.Request) http.Header {
 	headers := http.Header{}
 	headers.Add("User-Agent", req.Header.Get("User-Agent"))
 	headers.Add("Cookie", req.Header.Get("Cookie"))
 	headers.Add("Origin", req.Header.Get("Origin"))
+	return headers
+}
 
-	c, res, err := websocket.DefaultDialer.Dial(req.URL.String(), headers)
-	if err != nil {
-		if res != nil {
-			log.Println("连接失败，响应头:")
-			for k, v := range res.Header {
-				log.Printf("%s: %s", k, v)
-			}
-		}
-		log.Fatalf("连接失败: %v", err)
+func connectWebSocket(req *http.Request) (*websocket.Conn, *http.Response, error) {
+	return websocket.DefaultDialer.Dial(req.URL.String(), buildWebSocketHeaders(req))
+}
+
+func shouldReconnect(err error) bool {
+	if err == nil {
+		return false
 	}
-	defer c.Close()
-
-	log.Println("连接成功！")
-	if *reset {
-		log.Println("发送新游戏请求...")
-		if err := c.WriteMessage(websocket.TextMessage, []byte(`{"type":"new_game","data":{}}`)); err != nil {
-			log.Fatalf("发送新游戏请求失败: %v", err)
-		}
+	if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+		return false
+	}
+	if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) {
+		return true
 	}
 
-	done := make(chan struct{})
+	errMsg := strings.ToLower(err.Error())
+	reconnectHints := []string{
+		"unexpected eof",
+		"broken pipe",
+		"connection reset by peer",
+		"i/o timeout",
+		"use of closed network connection",
+		"connection refused",
+		"handshake timeout",
+	}
+	for _, hint := range reconnectHints {
+		if strings.Contains(errMsg, hint) {
+			return true
+		}
+	}
+	return true
+}
 
-	// --- Goroutine 1: 读取器 (生产者) ---
-	// 这个goroutine只负责从websocket读取消息并放入channel
+func closeWebSocketGracefully(c *websocket.Conn) {
+	if c == nil {
+		return
+	}
+	if err := c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")); err != nil && !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+		log.Println("发送关闭消息失败:", err)
+	}
+	if err := c.Close(); err != nil {
+		log.Println("关闭连接失败:", err)
+	}
+}
+
+func runSession(c *websocket.Conn, ai *AI, interrupt <-chan os.Signal) (bool, error) {
+	gameStateChan := make(chan GameStateData, 1)
+	sessionDone := make(chan sessionEvent, 1)
+
+	var notifyOnce sync.Once
+	notify := func(reconnect bool, err error) {
+		notifyOnce.Do(func() {
+			sessionDone <- sessionEvent{reconnect: reconnect, err: err}
+		})
+	}
+
 	go func() {
-		defer close(done)
+		defer close(gameStateChan)
 		for {
 			_, message, err := c.ReadMessage()
 			if err != nil {
 				log.Println("读取器: 读取消息失败:", err)
-				close(gameStateChan) // 关闭channel以通知处理器退出
+				notify(shouldReconnect(err), err)
 				return
 			}
 
@@ -493,42 +505,42 @@ func main() {
 			if err := json.Unmarshal(message, &serverMsg); err != nil {
 				continue
 			}
-			if serverMsg.Type == "game_state" {
-				var gameState GameStateData
-				if err := json.Unmarshal(serverMsg.Data, &gameState); err != nil {
-					continue
-				}
-				// 使用非阻塞的方式发送到channel
-				// 如果channel已满，先清空再放入最新的
-				select {
-				case <-gameStateChan: // 清空旧的
-				default:
-				}
-				gameStateChan <- gameState // 放入最新的
+			if serverMsg.Type != "game_state" {
+				continue
 			}
+
+			var gameState GameStateData
+			if err := json.Unmarshal(serverMsg.Data, &gameState); err != nil {
+				continue
+			}
+
+			select {
+			case <-gameStateChan:
+			default:
+			}
+			gameStateChan <- gameState
 		}
 	}()
-	// --- Goroutine 2: 处理器 (消费者) ---
-	// 这个goroutine负责处理游戏逻辑和AI计算
+
 	go func() {
 		var currentScore int
-		for gameState := range gameStateChan { // 从channel中读取数据
+		for gameState := range gameStateChan {
 			currentScore = gameState.Score
 			if gameState.GameOver || gameState.Message == "Game is already finished" {
 				log.Println("处理器: 游戏结束!", "最终得分:", currentScore)
 				if err := c.WriteMessage(websocket.TextMessage, []byte(`{"type":"new_game","data":{}}`)); err != nil {
 					log.Println("处理器: 发送重置新对局请求失败:", err)
-				} else {
-					log.Println("处理器: 已发送重置新对局请求")
+					notify(shouldReconnect(err), err)
+					return
 				}
-				time.Sleep(1 * time.Second)
-				interrupt <- os.Interrupt
-				return // 结束处理器goroutine
+				log.Println("处理器: 已发送重置新对局请求")
+				time.Sleep(time.Second)
+				notify(false, nil)
+				return
 			}
 
 			fmt.Printf("\n--- 收到新状态 | 分数: %d ---\n", gameState.Score)
 			gameState.Board.printBoard()
-			// 后续的AI计算和发送逻辑与之前完全相同
 			startTime := time.Now()
 			log.Println("AI 正在并行计算最佳移动...")
 			bestDir := ai.FindBestMove(gameState.Board)
@@ -548,6 +560,7 @@ func main() {
 			log.Printf("发送移动指令: %s", string(moveJSON))
 			if err := c.WriteMessage(websocket.TextMessage, moveJSON); err != nil {
 				log.Println("发送移动指令失败:", err)
+				notify(shouldReconnect(err), err)
 				return
 			}
 		}
@@ -556,14 +569,94 @@ func main() {
 	select {
 	case <-interrupt:
 		log.Println("收到中断信号，正在关闭连接...")
-	case <-done:
-		log.Println("连接已关闭，准备退出...")
+		return false, nil
+	case event := <-sessionDone:
+		return event.reconnect, event.err
+	}
+}
+
+// --- Main Application Logic (主程序逻辑) ---
+func main() {
+	url := flag.String("path", "http.txt", "http文本路径")
+	depth := flag.Int("depth", 4, "AI 决策深度，推荐4-6。默认为4")
+	reset := flag.Bool("reset", false, "是否每次运行开启新的一局")
+	flag.Parse()
+
+	fmt.Printf("2048 死算 版本: %s\n", version)
+	httpRequestText, err := os.ReadFile(*url)
+	if err != nil {
+		log.Fatalf("读取HTTP请求文件 '%s' 失败: %v", *url, err)
+	}
+	req, err := parseHTTPRequest(string(httpRequestText))
+	if err != nil {
+		log.Fatalf("解析HTTP请求错误: %v\n", err)
 	}
 
-	if err := c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")); err != nil {
-		log.Println("发送关闭消息失败:", err)
+	log.Printf("目标连接: %s", req.URL.String())
+	log.Printf("AI决策深度设置为: %d", *depth)
+
+	ai := NewAI(*depth)
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+
+	resetOnNextConnect := *reset
+	const reconnectDelay = 2 * time.Second
+
+	for attempt := 1; ; attempt++ {
+		log.Printf("正在连接到 websocket（尝试 #%d）...", attempt)
+		c, res, err := connectWebSocket(req)
+		if err != nil {
+			if res != nil {
+				log.Println("连接失败，响应头:")
+				for k, v := range res.Header {
+					log.Printf("%s: %s", k, v)
+				}
+			}
+			log.Printf("连接失败: %v", err)
+			select {
+			case <-interrupt:
+				log.Println("收到中断信号，停止重连")
+				return
+			case <-time.After(reconnectDelay):
+				continue
+			}
+		}
+
+		log.Println("连接成功！")
+		if resetOnNextConnect {
+			log.Println("发送新游戏请求...")
+			if err := c.WriteMessage(websocket.TextMessage, []byte(`{"type":"new_game","data":{}}`)); err != nil {
+				log.Printf("发送新游戏请求失败: %v", err)
+				closeWebSocketGracefully(c)
+				select {
+				case <-interrupt:
+					log.Println("收到中断信号，停止重连")
+					return
+				case <-time.After(reconnectDelay):
+					continue
+				}
+			}
+			resetOnNextConnect = false
+		}
+
+		reconnect, err := runSession(c, ai, interrupt)
+		closeWebSocketGracefully(c)
+		if !reconnect {
+			if err == nil {
+				return
+			}
+			log.Printf("连接结束: %v", err)
+			return
+		}
+
+		log.Printf("连接异常中断，%s 后自动重连...", reconnectDelay)
+		select {
+		case <-interrupt:
+			log.Println("收到中断信号，停止重连")
+			return
+		case <-time.After(reconnectDelay):
+		}
 	}
-	time.Sleep(time.Second) // 等待关闭消息发送
 }
 
 // --- 游戏逻辑与辅助函数 ---
