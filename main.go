@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -48,6 +47,11 @@ type MoveData struct {
 type Board [4][4]int
 type Direction int
 
+type cellPos struct {
+	r int
+	c int
+}
+
 const (
 	Up Direction = iota
 	Down
@@ -55,7 +59,8 @@ const (
 	Right
 )
 
-var directionToString = map[Direction]string{Up: "up", Down: "down", Left: "left", Right: "right"}
+var allDirections = [...]Direction{Up, Down, Left, Right}
+var directionToString = [...]string{"up", "down", "left", "right"}
 
 // --- AI 核心 (重构后) ---
 
@@ -77,25 +82,30 @@ func (b *Board) flattenBoard() [16]int {
 }
 
 // MemoizationCache 定义一个线程安全的缓存结构
+type CacheKey struct {
+	Board [16]int
+	Depth int
+}
+
 type MemoizationCache struct {
 	mu    sync.RWMutex
-	cache map[[16]int]float64
+	cache map[CacheKey]float64
 }
 
 func NewMemoizationCache() *MemoizationCache {
 	return &MemoizationCache{
-		cache: make(map[[16]int]float64),
+		cache: make(map[CacheKey]float64),
 	}
 }
 
-func (mc *MemoizationCache) Get(key [16]int) (float64, bool) {
+func (mc *MemoizationCache) Get(key CacheKey) (float64, bool) {
 	mc.mu.RLock()
 	defer mc.mu.RUnlock()
 	val, found := mc.cache[key]
 	return val, found
 }
 
-func (mc *MemoizationCache) Set(key [16]int, value float64) {
+func (mc *MemoizationCache) Set(key CacheKey, value float64) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 	mc.cache[key] = value
@@ -118,17 +128,120 @@ func getLog2(n int) float64 {
 	return 0 // 对于0或者不在缓存中的值返回0
 }
 
+func monotonicityScore(b Board) float64 {
+	var totals [4]float64
+
+	for r := 0; r < 4; r++ {
+		for c := 0; c < 3; c++ {
+			current := getLog2(b[r][c])
+			next := getLog2(b[r][c+1])
+			diff := current - next
+			if diff > 0 {
+				totals[0] += diff
+			} else {
+				totals[1] -= diff
+			}
+		}
+	}
+
+	for c := 0; c < 4; c++ {
+		for r := 0; r < 3; r++ {
+			current := getLog2(b[r][c])
+			next := getLog2(b[r+1][c])
+			diff := current - next
+			if diff > 0 {
+				totals[2] += diff
+			} else {
+				totals[3] -= diff
+			}
+		}
+	}
+
+	return math.Max(totals[0], totals[1]) + math.Max(totals[2], totals[3])
+}
+
+func cornerBonus(b Board, maxValue int) float64 {
+	if maxValue == 0 {
+		return 0
+	}
+	corners := [4]int{b[0][0], b[0][3], b[3][0], b[3][3]}
+	for _, corner := range corners {
+		if corner == maxValue {
+			return getLog2(maxValue) * 2.0
+		}
+	}
+	return 0
+}
+
+func mergePotential(b Board) float64 {
+	merges := 0.0
+	for r := 0; r < 4; r++ {
+		for c := 0; c < 3; c++ {
+			if b[r][c] != 0 && b[r][c] == b[r][c+1] {
+				merges += getLog2(b[r][c])
+			}
+		}
+	}
+	for c := 0; c < 4; c++ {
+		for r := 0; r < 3; r++ {
+			if b[r][c] != 0 && b[r][c] == b[r+1][c] {
+				merges += getLog2(b[r][c])
+			}
+		}
+	}
+	return merges
+}
+
+func maxTileCenterPenalty(b Board, maxValue int) float64 {
+	if maxValue == 0 {
+		return 0
+	}
+	for r := 1; r <= 2; r++ {
+		for c := 1; c <= 2; c++ {
+			if b[r][c] == maxValue {
+				return getLog2(maxValue) * 2.5
+			}
+		}
+	}
+	return 0
+}
+
+func snakePatternScore(b Board) float64 {
+	weights := [4][4]float64{
+		{65536, 32768, 16384, 8192},
+		{512, 1024, 2048, 4096},
+		{256, 128, 64, 32},
+		{2, 4, 8, 16},
+	}
+
+	score := 0.0
+	for r := 0; r < 4; r++ {
+		for c := 0; c < 4; c++ {
+			if b[r][c] != 0 {
+				score += float64(b[r][c]) * weights[r][c]
+			}
+		}
+	}
+	return math.Log(score + 1)
+}
+
 // evaluateBoard 评估函数
 func evaluateBoard(b Board) float64 {
 	emptyCells := 0
-	monotonicity := 0.0
+	monotonicity := monotonicityScore(b)
 	smoothness := 0.0
 	maxValue := 0
+	validMoves := 0
 
-	const monotonicityWeight = 1.0
+	const monotonicityWeight = 1.3
 	const smoothnessWeight = 0.1
 	const emptyCellsWeight = 2.7
 	const maxValueWeight = 1.0
+	const cornerWeight = 1.8
+	const mergeWeight = 1.2
+	const snakeWeight = 2.0
+	const centerPenaltyWeight = 1.4
+	const lowMovePenaltyWeight = 3.0
 
 	for r := 0; r < 4; r++ {
 		for c := 0; c < 4; c++ {
@@ -139,7 +252,6 @@ func evaluateBoard(b Board) float64 {
 				if cellValue > maxValue {
 					maxValue = cellValue
 				}
-				// 平滑性
 				if c+1 < 4 && b[r][c+1] != 0 {
 					smoothness -= math.Abs(getLog2(cellValue) - getLog2(b[r][c+1]))
 				}
@@ -149,25 +261,54 @@ func evaluateBoard(b Board) float64 {
 			}
 		}
 	}
-	// 简单的单调性计算
-	// (为了完整性，可以添加一个更复杂的单调性计算逻辑)
+
+	validMoves = len(getValidMoves(b))
+	lowMovePenalty := 0.0
+	if validMoves <= 1 {
+		lowMovePenalty = 14.0
+	} else if validMoves == 2 {
+		lowMovePenalty = 5.0
+	}
+
+	maxValueScore := getLog2(maxValue)
+
 	return monotonicity*monotonicityWeight +
 		smoothness*smoothnessWeight +
 		math.Log(float64(emptyCells+1))*emptyCellsWeight +
-		float64(maxValue)*maxValueWeight
+		maxValueScore*maxValueWeight +
+		cornerBonus(b, maxValue)*cornerWeight +
+		mergePotential(b)*mergeWeight +
+		snakePatternScore(b)*snakeWeight -
+		maxTileCenterPenalty(b, maxValue)*centerPenaltyWeight -
+		lowMovePenalty*lowMovePenaltyWeight
 }
 
 // AI 结构体，封装了所有AI相关的逻辑和状态
 type AI struct {
-	depth int
-	cache *MemoizationCache // AI实例共享一个缓存
+	baseDepth int
+	cache     *MemoizationCache // AI实例共享一个缓存
 }
 
 // NewAI 创建一个新的AI实例
 func NewAI(depth int) *AI {
 	return &AI{
-		depth: depth,
-		cache: NewMemoizationCache(), // 在创建AI时初始化缓存
+		baseDepth: depth,
+		cache:     NewMemoizationCache(), // 在创建AI时初始化缓存
+	}
+}
+
+func dynamicDepth(b Board, baseDepth int) int {
+	emptyCells := len(collectEmptyCells(b))
+	switch {
+	case emptyCells >= 8:
+		if baseDepth > 1 {
+			return baseDepth - 1
+		}
+		return 1
+	case emptyCells >= 4:
+		return baseDepth
+	default:
+		return baseDepth + 1
 	}
 }
 
@@ -175,16 +316,12 @@ func NewAI(depth int) *AI {
 func (ai *AI) FindBestMove(b Board) Direction {
 	bestScore := -math.MaxFloat64
 	bestMove := Up // 默认移动，以防万一
+	depth := dynamicDepth(b, ai.baseDepth)
 
 	var wg sync.WaitGroup
 	results := make(chan MoveResult, 4)
 
-	var validMoves []Direction
-	for _, dir := range []Direction{Up, Down, Left, Right} {
-		if _, moved := Move(b, dir); moved {
-			validMoves = append(validMoves, dir)
-		}
-	}
+	validMoves := getValidMoves(b)
 
 	if len(validMoves) == 0 {
 		return bestMove // 没有有效移动，返回默认值
@@ -197,7 +334,7 @@ func (ai *AI) FindBestMove(b Board) Direction {
 			defer wg.Done()
 			newBoard, _ := Move(b, d)
 			// 所有goroutine共享同一个AI实例的缓存
-			score := ai.searchExpectationNode(newBoard, ai.depth-1)
+			score := ai.searchExpectationNode(newBoard, depth-1)
 			results <- MoveResult{Dir: d, Score: score}
 		}(dir)
 	}
@@ -224,7 +361,7 @@ func (ai *AI) searchMaxNode(b Board, depth int) float64 {
 	bestScore := -math.MaxFloat64
 	hasMoved := false
 
-	for _, dir := range []Direction{Up, Down, Left, Right} {
+	for _, dir := range allDirections {
 		newBoard, moved := Move(b, dir)
 		if moved {
 			hasMoved = true
@@ -247,19 +384,12 @@ func (ai *AI) searchExpectationNode(b Board, depth int) float64 {
 		return evaluateBoard(b)
 	}
 
-	flatKey := b.flattenBoard()
-	if score, found := ai.cache.Get(flatKey); found {
+	cacheKey := CacheKey{Board: b.flattenBoard(), Depth: depth}
+	if score, found := ai.cache.Get(cacheKey); found {
 		return score
 	}
 
-	var emptyCells []struct{ r, c int }
-	for r := 0; r < 4; r++ {
-		for c := 0; c < 4; c++ {
-			if b[r][c] == 0 {
-				emptyCells = append(emptyCells, struct{ r, c int }{r, c})
-			}
-		}
-	}
+	emptyCells := collectEmptyCells(b)
 
 	if len(emptyCells) == 0 {
 		return evaluateBoard(b) // 没有空格，游戏即将结束
@@ -287,7 +417,7 @@ func (ai *AI) searchExpectationNode(b Board, depth int) float64 {
 	avgScore4 := totalScore4 / float64(len(emptyCells))
 
 	finalScore := 0.9*avgScore2 + 0.1*avgScore4
-	ai.cache.Set(flatKey, finalScore)
+	ai.cache.Set(cacheKey, finalScore)
 
 	return finalScore
 }
@@ -340,7 +470,9 @@ func main() {
 	log.Println("连接成功！")
 	if *reset {
 		log.Println("发送新游戏请求...")
-		c.WriteMessage(websocket.TextMessage, []byte(`{"type":"new_game","data":{}}`))
+		if err := c.WriteMessage(websocket.TextMessage, []byte(`{"type":"new_game","data":{}}`)); err != nil {
+			log.Fatalf("发送新游戏请求失败: %v", err)
+		}
 	}
 
 	done := make(chan struct{})
@@ -384,8 +516,11 @@ func main() {
 			currentScore = gameState.Score
 			if gameState.GameOver || gameState.Message == "Game is already finished" {
 				log.Println("处理器: 游戏结束!", "最终得分:", currentScore)
-				c.WriteMessage(websocket.TextMessage, []byte(`{"type":"new_game","data":{}}`))
-				log.Println("处理器: 已发送重置新对局请求")
+				if err := c.WriteMessage(websocket.TextMessage, []byte(`{"type":"new_game","data":{}}`)); err != nil {
+					log.Println("处理器: 发送重置新对局请求失败:", err)
+				} else {
+					log.Println("处理器: 已发送重置新对局请求")
+				}
 				time.Sleep(1 * time.Second)
 				interrupt <- os.Interrupt
 				return // 结束处理器goroutine
@@ -395,16 +530,9 @@ func main() {
 			gameState.Board.printBoard()
 			// 后续的AI计算和发送逻辑与之前完全相同
 			startTime := time.Now()
-			var bestDir Direction
-			if gameState.Score < 20 {
-				log.Println("AI 决策: 随机移动")
-				possibleDirs := []Direction{Up, Down, Left, Right}
-				bestDir = possibleDirs[rand.Intn(len(possibleDirs))]
-			} else {
-				log.Println("AI 正在并行计算最佳移动...")
-				bestDir = ai.FindBestMove(gameState.Board)
-				log.Printf("AI 决策: %s", directionToString[bestDir])
-			}
+			log.Println("AI 正在并行计算最佳移动...")
+			bestDir := ai.FindBestMove(gameState.Board)
+			log.Printf("AI 决策: %s", directionToString[bestDir])
 			duration := time.Since(startTime)
 			log.Printf("计算耗时: %s", duration)
 			moveJSON, err := moveToJson(bestDir)
@@ -425,21 +553,49 @@ func main() {
 		}
 	}()
 
-	<-interrupt
-	log.Println("收到中断信号，正在关闭连接...")
-	c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+	select {
+	case <-interrupt:
+		log.Println("收到中断信号，正在关闭连接...")
+	case <-done:
+		log.Println("连接已关闭，准备退出...")
+	}
+
+	if err := c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")); err != nil {
+		log.Println("发送关闭消息失败:", err)
+	}
 	time.Sleep(time.Second) // 等待关闭消息发送
 }
 
 // --- 游戏逻辑与辅助函数 ---
 
 func moveToJson(direction Direction) ([]byte, error) {
-	moveStr := directionToString[direction]
 	moveCmd := ClientMessage{
 		Type: "move",
-		Data: MoveData{Direction: moveStr},
+		Data: MoveData{Direction: directionToString[direction]},
 	}
 	return json.Marshal(moveCmd)
+}
+
+func getValidMoves(b Board) []Direction {
+	validMoves := make([]Direction, 0, len(allDirections))
+	for _, dir := range allDirections {
+		if _, moved := Move(b, dir); moved {
+			validMoves = append(validMoves, dir)
+		}
+	}
+	return validMoves
+}
+
+func collectEmptyCells(b Board) []cellPos {
+	emptyCells := make([]cellPos, 0, 16)
+	for r := 0; r < 4; r++ {
+		for c := 0; c < 4; c++ {
+			if b[r][c] == 0 {
+				emptyCells = append(emptyCells, cellPos{r: r, c: c})
+			}
+		}
+	}
+	return emptyCells
 }
 
 func parseHTTPRequest(text string) (*http.Request, error) {
